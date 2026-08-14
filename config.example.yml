@@ -1,0 +1,40 @@
+input_dirs:
+- /path/to/input1
+- /path/to/input2
+
+output_dir: /path/to/output
+data_file: data.yml
+
+extensions:
+- .mp4
+- .mkv
+- .mov
+- .avi
+- .webm
+- .m4v
+- .ts
+- .mts
+- .m2ts
+
+ffmpeg: ffmpeg
+ffprobe: ffprobe
+hwaccel: cuda
+cuda_decoder: auto
+concurrent_workers: 5
+
+encoder_preference: auto
+nvenc_preset: p1
+nvenc_tune: ll
+nvenc_cq: 28
+nvenc_spatial_aq: false
+nvenc_temporal_aq: false
+nvenc_multipass: disabled
+nvenc_rc_lookahead: 0
+svtav1_preset: 6
+svtav1_crf: 32
+
+audio_codec: aac
+audio_bitrate: 192k
+
+faststart: true
+overwrite: false
