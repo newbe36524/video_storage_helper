@@ -21,6 +21,8 @@ ffprobe: ffprobe
 hwaccel: cuda
 cuda_decoder: auto
 concurrent_workers: 5
+hash_prefix_bytes: 1048576
+max_processed_per_run: 0
 
 encoder_preference: auto
 nvenc_preset: p1

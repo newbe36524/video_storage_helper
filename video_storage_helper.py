@@ -40,6 +40,8 @@ class AppConfig:
     hwaccel: str
     cuda_decoder: str
     concurrent_workers: int
+    hash_prefix_bytes: int
+    max_processed_per_run: int
     encoder_preference: str
     nvenc_preset: str
     nvenc_tune: str
@@ -107,6 +109,9 @@ def load_config(config_path: Path) -> AppConfig:
     output_dir = resolve_path(base_dir, raw.get("output_dir", "output"))
     data_file = resolve_path(base_dir, raw.get("data_file", "data.yml"))
 
+    hash_prefix_bytes = max(1, int(raw.get("hash_prefix_bytes", 1024 * 1024)))
+    max_processed_per_run = int(raw.get("max_processed_per_run", 0))
+
     return AppConfig(
         input_dirs=resolved_input_dirs,
         output_dir=output_dir,
@@ -117,6 +122,8 @@ def load_config(config_path: Path) -> AppConfig:
         hwaccel=str(raw.get("hwaccel", "cuda")),
         cuda_decoder=str(raw.get("cuda_decoder", "auto")),
         concurrent_workers=max(1, int(raw.get("concurrent_workers", 5))),
+        hash_prefix_bytes=hash_prefix_bytes,
+        max_processed_per_run=max(0, max_processed_per_run),
         encoder_preference=str(raw.get("encoder_preference", "auto")).lower(),
         nvenc_preset=str(raw.get("nvenc_preset", "p5")),
         nvenc_tune=str(raw.get("nvenc_tune", "hq")),
@@ -134,12 +141,21 @@ def load_config(config_path: Path) -> AppConfig:
     )
 
 
-def sha256_of_file(path: Path) -> str:
+def sha256_of_file(path: Path, limit_bytes: int = 1024 * 1024) -> str:
     hasher = hashlib.sha256()
     with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        remaining = max(1, limit_bytes)
+        while remaining > 0:
+            chunk = handle.read(min(1024 * 1024, remaining))
+            if not chunk:
+                break
             hasher.update(chunk)
+            remaining -= len(chunk)
     return hasher.hexdigest()
+
+
+def hash_prefix_of_file(path: Path, limit_bytes: int = 1024 * 1024) -> str:
+    return sha256_of_file(path, limit_bytes=limit_bytes)
 
 
 def is_within(child: Path, parent: Path) -> bool:
@@ -213,24 +229,43 @@ def check_ffmpeg_decoders(ffmpeg_executable: str) -> set[str]:
     return decoders
 
 
-def probe_video_codec(config: AppConfig, source: Path) -> str | None:
+def check_ffmpeg_hwaccels(ffmpeg_executable: str) -> set[str]:
     result = subprocess.run(
-        [
-            config.ffprobe,
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=codec_name",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            str(source),
-        ],
+        [ffmpeg_executable, "-hide_banner", "-hwaccels"],
         capture_output=True,
         text=True,
         check=True,
     )
+    hwaccels: set[str] = set()
+    for line in result.stdout.splitlines():
+        stripped = line.strip().lower()
+        if stripped and stripped != "hardware acceleration methods:":
+            hwaccels.add(stripped)
+    return hwaccels
+
+
+def probe_video_codec(config: AppConfig, source: Path) -> str | None:
+    try:
+        result = subprocess.run(
+            [
+                config.ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(source),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError:
+        return None
+
     codec_name = result.stdout.strip().lower()
     return codec_name or None
 
@@ -268,26 +303,50 @@ def resolve_cuda_decoder_from_set(config: AppConfig, codec_name: str | None, ava
     return None
 
 
+def codec_supports_generic_cuda_hwaccel(codec_name: str | None) -> bool:
+    return codec_name in {"h264", "avc1", "hevc", "h265", "hvc1", "mpeg2video", "vp9"}
+
+
 def build_decode_input_args(
     config: AppConfig,
     source: Path,
     encoder: str,
     available_decoders: set[str],
+    available_hwaccels: set[str],
 ) -> tuple[list[str], str]:
-    if encoder != "av1_nvenc" or config.hwaccel != "cuda":
-        return [], "software"
+    if encoder != "av1_nvenc":
+        return [], "software:encoder_not_av1_nvenc"
+
+    if config.hwaccel != "cuda":
+        return [], "software:hwaccel_not_cuda"
 
     codec_name = probe_video_codec(config, source)
+    if not codec_name:
+        return [], "software:codec_probe_failed"
+
     cuda_decoder = resolve_cuda_decoder_from_set(config, codec_name, available_decoders)
-    if cuda_decoder is None:
-        return [], "software"
+    if cuda_decoder is not None:
+        return ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda", "-c:v", cuda_decoder], f"cuda+{cuda_decoder}"
 
-    return ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda", "-c:v", cuda_decoder], f"cuda+{cuda_decoder}"
+    if config.cuda_decoder != "auto":
+        return [], f"software:configured_decoder_unavailable:{config.cuda_decoder}"
+
+    if "cuda" in available_hwaccels and codec_supports_generic_cuda_hwaccel(codec_name):
+        return ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"], f"cuda:generic:{codec_name}"
+
+    return [], f"software:no_decoder_for_codec:{codec_name}"
 
 
-def print_detection(config: AppConfig, encoder: str, available_encoders: set[str], available_decoders: set[str]) -> None:
+def print_detection(
+    config: AppConfig,
+    encoder: str,
+    available_encoders: set[str],
+    available_decoders: set[str],
+    available_hwaccels: set[str],
+) -> None:
     av1_encoders = sorted([name for name in available_encoders if "av1" in name])
     cuvid_decoders = sorted([name for name in available_decoders if name.endswith("_cuvid")])
+    hwaccels = sorted(available_hwaccels)
 
     print("detection:")
     print(f"  selected_encoder: {encoder}")
@@ -296,11 +355,14 @@ def print_detection(config: AppConfig, encoder: str, available_encoders: set[str
     print(f"  concurrent_workers: {config.concurrent_workers}")
     print(f"  available_av1_encoders: {', '.join(av1_encoders) if av1_encoders else 'none'}")
     print(f"  available_cuvid_decoders: {', '.join(cuvid_decoders) if cuvid_decoders else 'none'}")
+    print(f"  available_hwaccels: {', '.join(hwaccels) if hwaccels else 'none'}")
     if config.hwaccel == "cuda" and encoder == "av1_nvenc":
         if cuvid_decoders:
             print("  decode_strategy: try cuda decoder per input codec, fallback to software")
+        elif "cuda" in available_hwaccels:
+            print("  decode_strategy: try generic cuda hwaccel, fallback to software")
         else:
-            print("  decode_strategy: software (no cuvid decoder available)")
+            print("  decode_strategy: software (cuda hwaccel unavailable)")
     else:
         print("  decode_strategy: software")
 
@@ -338,10 +400,11 @@ def build_ffmpeg_command(
     output: Path,
     encoder: str,
     available_decoders: set[str],
+    available_hwaccels: set[str],
 ) -> tuple[list[str], str]:
     command = [config.ffmpeg, "-hide_banner", "-y" if config.overwrite else "-n"]
 
-    decode_args, decode_label = build_decode_input_args(config, source, encoder, available_decoders)
+    decode_args, decode_label = build_decode_input_args(config, source, encoder, available_decoders, available_hwaccels)
     command.extend(decode_args)
 
     command.extend(["-i", str(source)])
@@ -442,6 +505,7 @@ def process_file(
     sha256_value: str,
     encoder: str,
     available_decoders: set[str],
+    available_hwaccels: set[str],
     output_path: Path,
 ) -> tuple[str, str, str, str]:
 
@@ -450,7 +514,14 @@ def process_file(
     if temp_output.exists():
         temp_output.unlink()
 
-    command, decode_label = build_ffmpeg_command(config, source, temp_output, encoder, available_decoders)
+    command, decode_label = build_ffmpeg_command(
+        config,
+        source,
+        temp_output,
+        encoder,
+        available_decoders,
+        available_hwaccels,
+    )
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0:
         if temp_output.exists():
@@ -519,6 +590,7 @@ def main(argv: list[str] | None = None) -> int:
         config = load_config(config_path)
         available_encoders = check_ffmpeg_encoders(config.ffmpeg)
         available_decoders = check_ffmpeg_decoders(config.ffmpeg)
+        available_hwaccels = check_ffmpeg_hwaccels(config.ffmpeg)
         encoder = select_encoder(config)
         history = load_history(config.data_file)
         candidates = discover_video_files(config.input_dirs, config.extensions, [config.output_dir])
@@ -535,7 +607,7 @@ def main(argv: list[str] | None = None) -> int:
         queued_sha256: set[str] = set()
         submitted_jobs = 0
 
-        print_detection(config, encoder, available_encoders, available_decoders)
+        print_detection(config, encoder, available_encoders, available_decoders, available_hwaccels)
         print_plan(config, encoder, len(candidates))
         print("process:")
         if not candidates:
@@ -543,88 +615,117 @@ def main(argv: list[str] | None = None) -> int:
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=config.concurrent_workers) as executor:
             future_to_job: dict[concurrent.futures.Future[tuple[str, str, str, str]], tuple[Path, str, Path]] = {}
+            candidate_iter = iter(sorted(candidates))
+            limit_reached = False
 
-            for source in sorted(candidates):
-                print(f"process: {source}")
-                try:
-                    sha256_value = sha256_of_file(source)
-                    record = history_map.setdefault(sha256_value, {})
-                    output_path = Path(record.get("output_path") or build_output_path(config, source, sha256_value))
-
-                    source_stat = source.stat()
-                    sources = record.setdefault("sources", [])
-                    sources.append(
-                        {
-                            "path": str(source),
-                            "size": source_stat.st_size,
-                            "mtime": source_stat.st_mtime,
-                            "seen_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                        }
+            while True:
+                while (
+                    len(future_to_job) < config.concurrent_workers
+                    and not limit_reached
+                    and (
+                        config.max_processed_per_run == 0
+                        or processed + len(future_to_job) < config.max_processed_per_run
                     )
+                ):
+                    try:
+                        source = next(candidate_iter)
+                    except StopIteration:
+                        break
 
-                    already_processed = bool(record.get("processed_at")) and output_path.exists()
-                    if already_processed:
-                        record.setdefault("output_path", str(output_path))
-                        record.setdefault("encoder", encoder)
-                        print(f"skip processed {source}")
-                        skipped += 1
-                        continue
+                    print(f"process: {source}")
+                    try:
+                        sha256_value = hash_prefix_of_file(source, config.hash_prefix_bytes)
+                        record = history_map.setdefault(sha256_value, {})
+                        output_path = Path(record.get("output_path") or build_output_path(config, source, sha256_value))
 
-                    if sha256_value in queued_sha256:
-                        print(f"skip duplicate sha256 in this batch: {source}")
-                        skipped += 1
-                        continue
+                        source_stat = source.stat()
+                        sources = record.setdefault("sources", [])
+                        sources.append(
+                            {
+                                "path": str(source),
+                                "size": source_stat.st_size,
+                                "mtime": source_stat.st_mtime,
+                                "seen_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                            }
+                        )
 
-                    queued_sha256.add(sha256_value)
-                    future = executor.submit(
-                        process_file,
-                        config,
-                        source,
-                        sha256_value,
-                        encoder,
-                        available_decoders,
-                        output_path,
-                    )
-                    future_to_job[future] = (source, sha256_value, output_path)
-                    submitted_jobs += 1
-                except Exception as exc:  # pragma: no cover - surfaced to the user
-                    failed += 1
-                    print(f"error: {source}: {exc}", file=sys.stderr)
+                        already_processed = bool(record.get("processed_at")) and output_path.exists()
+                        if already_processed:
+                            record.setdefault("output_path", str(output_path))
+                            record.setdefault("encoder", encoder)
+                            print(f"skip processed {source}")
+                            skipped += 1
+                            continue
+
+                        if sha256_value in queued_sha256:
+                            print(f"skip duplicate sha256 in this batch: {source}")
+                            skipped += 1
+                            continue
+
+                        queued_sha256.add(sha256_value)
+                        future = executor.submit(
+                            process_file,
+                            config,
+                            source,
+                            sha256_value,
+                            encoder,
+                            available_decoders,
+                            available_hwaccels,
+                            output_path,
+                        )
+                        future_to_job[future] = (source, sha256_value, output_path)
+                        submitted_jobs += 1
+                    except Exception as exc:  # pragma: no cover - surfaced to the user
+                        failed += 1
+                        print(f"error: {source}: {exc}", file=sys.stderr)
+
+                if not future_to_job:
+                    break
+
+                done, _ = concurrent.futures.wait(future_to_job, return_when=concurrent.futures.FIRST_COMPLETED)
+                for future in done:
+                    source, sha256_value, output_path = future_to_job.pop(future)
+                    try:
+                        done_sha, done_source, done_output_path, decode_label = future.result()
+                        record = history_map.setdefault(done_sha, {})
+                        record.update(
+                            {
+                                "output_path": done_output_path,
+                                "encoder": encoder,
+                                "decode": decode_label,
+                                "processed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                                "status": "processed",
+                            }
+                        )
+                        print(f"processed {done_source} -> {done_output_path} (decode={decode_label})")
+                        processed += 1
+                        if config.max_processed_per_run > 0 and processed >= config.max_processed_per_run:
+                            limit_reached = True
+                            print(
+                                f"limit reached: max_processed_per_run={config.max_processed_per_run}; stopping further processing",
+                                file=sys.stderr,
+                            )
+                    except Exception as exc:  # pragma: no cover - surfaced to the user
+                        record = history_map.setdefault(sha256_value, {})
+                        record.update(
+                            {
+                                "output_path": str(output_path),
+                                "encoder": encoder,
+                                "status": "failed",
+                                "last_error": str(exc),
+                                "failed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                            }
+                        )
+                        failed += 1
+                        print(f"error: {source}: {exc}", file=sys.stderr)
+                    finally:
+                        save_history(config.data_file, history)
+
+                if config.max_processed_per_run > 0 and processed >= config.max_processed_per_run:
+                    break
 
             if submitted_jobs:
                 print(f"parallel: running {submitted_jobs} job(s) with workers={config.concurrent_workers}")
-
-            for future in concurrent.futures.as_completed(future_to_job):
-                source, sha256_value, output_path = future_to_job[future]
-                try:
-                    done_sha, done_source, done_output_path, decode_label = future.result()
-                    record = history_map.setdefault(done_sha, {})
-                    record.update(
-                        {
-                            "output_path": done_output_path,
-                            "encoder": encoder,
-                            "decode": decode_label,
-                            "processed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                            "status": "processed",
-                        }
-                    )
-                    print(f"processed {done_source} -> {done_output_path} (decode={decode_label})")
-                    processed += 1
-                except Exception as exc:  # pragma: no cover - surfaced to the user
-                    record = history_map.setdefault(sha256_value, {})
-                    record.update(
-                        {
-                            "output_path": str(output_path),
-                            "encoder": encoder,
-                            "status": "failed",
-                            "last_error": str(exc),
-                            "failed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                        }
-                    )
-                    failed += 1
-                    print(f"error: {source}: {exc}", file=sys.stderr)
-                finally:
-                    save_history(config.data_file, history)
 
         summary_processed = processed
         summary_skipped = skipped

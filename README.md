@@ -24,6 +24,8 @@
 - `encoder_preference` 默认为 `auto`，会优先尝试 `av1_nvenc`。
 - `audio_codec` 默认是 `aac`，便于输出 mp4 的兼容性。
 - `concurrent_workers` 控制并发转码数量，默认 `5`。
+- `hash_prefix_bytes` 控制去重时只取文件前多少字节做 SHA256，默认 `1048576`（1 MiB）。
+- `max_processed_per_run` 控制本次运行最多成功处理多少个新文件，默认 `0` 表示不限制；跳过的文件不计入这个上限。
 - `hwaccel: cuda` 可以把可支持的输入改成 GPU 硬件解码；如果你的输入不是 H.264/H.265 或硬解不可用，脚本会继续走软件解码。
 - `nvenc_preset: p1`、`nvenc_tune: ll`、关闭 AQ 和 lookahead，会明显提高吞吐，但画质与压缩效率会下降。
 
