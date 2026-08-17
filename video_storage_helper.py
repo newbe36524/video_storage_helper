@@ -394,6 +394,12 @@ def build_output_path(config: AppConfig, source: Path, sha256_value: str) -> Pat
     return config.output_dir / f"{safe_stem}__{sha256_value[:12]}.mp4"
 
 
+def has_valid_output_file(path: Path) -> bool:
+    if not path.exists() or not path.is_file():
+        return False
+    return path.stat().st_size > 0
+
+
 def build_ffmpeg_command(
     config: AppConfig,
     source: Path,
@@ -523,6 +529,43 @@ def process_file(
         available_hwaccels,
     )
     result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0 and decode_label.startswith("cuda"):
+        # CUDA decode can fail on some files/builds; retry once with software decode.
+        if temp_output.exists():
+            temp_output.unlink()
+        software_config = dataclasses.replace(config, hwaccel="none")
+        fallback_command, fallback_decode_label = build_ffmpeg_command(
+            software_config,
+            source,
+            temp_output,
+            encoder,
+            available_decoders,
+            available_hwaccels,
+        )
+        fallback_result = subprocess.run(fallback_command, capture_output=True, text=True)
+        if fallback_result.returncode == 0 and has_valid_output_file(temp_output):
+            temp_output.replace(output_path)
+            if not has_valid_output_file(output_path):
+                raise RuntimeError(f"invalid output generated after software retry: {output_path}")
+            return (
+                sha256_value,
+                str(source),
+                str(output_path),
+                f"{decode_label}->retry:{fallback_decode_label}",
+            )
+
+        if temp_output.exists():
+            temp_output.unlink()
+        raise RuntimeError(
+            "ffmpeg failed after cuda decode + software decode retry"
+            f"\nCUDA_CMD: {' '.join(command)}"
+            f"\nCUDA_STDOUT:\n{result.stdout}"
+            f"\nCUDA_STDERR:\n{result.stderr}"
+            f"\nSW_CMD: {' '.join(fallback_command)}"
+            f"\nSW_STDOUT:\n{fallback_result.stdout}"
+            f"\nSW_STDERR:\n{fallback_result.stderr}"
+        )
+
     if result.returncode != 0:
         if temp_output.exists():
             temp_output.unlink()
@@ -531,6 +574,8 @@ def process_file(
         )
 
     temp_output.replace(output_path)
+    if not has_valid_output_file(output_path):
+        raise RuntimeError(f"invalid output generated (empty file): {output_path}")
     return sha256_value, str(source), str(output_path), decode_label
 
 
@@ -649,13 +694,16 @@ def main(argv: list[str] | None = None) -> int:
                             }
                         )
 
-                        already_processed = bool(record.get("processed_at")) and output_path.exists()
+                        already_processed = bool(record.get("processed_at")) and has_valid_output_file(output_path)
                         if already_processed:
                             record.setdefault("output_path", str(output_path))
                             record.setdefault("encoder", encoder)
                             print(f"skip processed {source}")
                             skipped += 1
                             continue
+
+                        if output_path.exists() and not has_valid_output_file(output_path):
+                            print(f"warn: stale empty output detected, reprocessing: {output_path}", file=sys.stderr)
 
                         if sha256_value in queued_sha256:
                             print(f"skip duplicate sha256 in this batch: {source}")
