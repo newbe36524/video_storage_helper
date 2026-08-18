@@ -22,4 +22,4 @@ then
   "$VENV_DIR/bin/python" -m pip install -r "$ROOT_DIR/requirements.txt" >/dev/null
 fi
 
-exec "$ROOT_DIR/transcode.sh" "$@"
+exec "$VENV_DIR/bin/invoke" run --config "$ROOT_DIR/config.yml" --operation archive_7z "$@"

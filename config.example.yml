@@ -1,8 +1,15 @@
-input_dirs:
+transcode_input_dirs:
+- /path/to/video-input
+
+transcode_output_dir: /path/to/video-output
+
+zip_input_dirs:
+- /path/to/archive-input
+
+zip_output_dir: /path/to/archive-output
 - /path/to/input1
 - /path/to/input2
 
-output_dir: /path/to/output
 data_file: data.yml
 
 extensions:
@@ -40,3 +47,8 @@ audio_bitrate: 192k
 
 faststart: true
 overwrite: false
+
+# Set operation to archive_7z to encrypt each source file instead.
+# seven_zip: 7z
+# seven_zip_password_env: VIDEO_STORAGE_7Z_PASSWORD
+# seven_zip_password: do-not-commit-a-password-here

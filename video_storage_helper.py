@@ -8,6 +8,7 @@ import dataclasses
 import datetime as dt
 import hashlib
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -31,6 +32,7 @@ DEFAULT_EXTENSIONS = [
 
 @dataclasses.dataclass(frozen=True)
 class AppConfig:
+    operation: str
     input_dirs: list[Path]
     output_dir: Path
     data_file: Path
@@ -56,6 +58,9 @@ class AppConfig:
     audio_bitrate: str
     faststart: bool
     overwrite: bool
+    seven_zip: str
+    seven_zip_password: str | None
+    seven_zip_password_env: str
 
 
 def load_yaml(path: Path) -> dict[str, Any]:
@@ -97,22 +102,37 @@ def parse_extensions(values: Any) -> set[str]:
     return {str(item).lower() for item in values}
 
 
-def load_config(config_path: Path) -> AppConfig:
+def load_config(config_path: Path, operation: str | None = None) -> AppConfig:
     raw = load_yaml(config_path)
     base_dir = config_path.parent.resolve()
 
-    input_dirs = raw.get("input_dirs") or raw.get("input_folders") or []
+    selected_operation = str(operation or raw.get("operation", "transcode")).lower()
+    if selected_operation == "archive_7z":
+        input_dirs = raw.get("zip_input_dirs") or raw.get("zip_input_folders") or []
+        output_value = raw.get("zip_output_dir")
+    else:
+        input_dirs = raw.get("transcode_input_dirs") or raw.get("transcode_input_folders") or []
+        output_value = raw.get("transcode_output_dir")
+
+    # Keep the old keys as a compatibility fallback for existing configurations.
+    input_dirs = input_dirs or raw.get("input_dirs") or raw.get("input_folders") or []
     if not input_dirs:
-        raise ValueError("config.yml must define at least one input dir under input_dirs")
+        raise ValueError(f"config.yml must define input dirs for {selected_operation}")
 
     resolved_input_dirs = [resolve_path(base_dir, item) for item in input_dirs]
-    output_dir = resolve_path(base_dir, raw.get("output_dir", "output"))
+    output_dir = resolve_path(base_dir, output_value or raw.get("output_dir", "output"))
     data_file = resolve_path(base_dir, raw.get("data_file", "data.yml"))
 
     hash_prefix_bytes = max(1, int(raw.get("hash_prefix_bytes", 1024 * 1024)))
     max_processed_per_run = int(raw.get("max_processed_per_run", 0))
+    if selected_operation not in {"transcode", "archive_7z"}:
+        raise ValueError("operation must be transcode or archive_7z")
+
+    configured_password = raw.get("seven_zip_password")
+    seven_zip_password = str(configured_password) if configured_password is not None else None
 
     return AppConfig(
+        operation=selected_operation,
         input_dirs=resolved_input_dirs,
         output_dir=output_dir,
         data_file=data_file,
@@ -138,6 +158,9 @@ def load_config(config_path: Path) -> AppConfig:
         audio_bitrate=str(raw.get("audio_bitrate", "192k")),
         faststart=parse_bool(raw.get("faststart", True), True),
         overwrite=parse_bool(raw.get("overwrite", False), False),
+        seven_zip=str(raw.get("seven_zip", "7z")),
+        seven_zip_password=seven_zip_password,
+        seven_zip_password_env=str(raw.get("seven_zip_password_env", "VIDEO_STORAGE_7Z_PASSWORD")),
     )
 
 
@@ -391,7 +414,8 @@ def select_encoder(config: AppConfig) -> str:
 
 def build_output_path(config: AppConfig, source: Path, sha256_value: str) -> Path:
     safe_stem = source.stem.replace(" ", "_")
-    return config.output_dir / f"{safe_stem}__{sha256_value[:12]}.mp4"
+    extension = ".7z" if config.operation == "archive_7z" else ".mp4"
+    return config.output_dir / f"{safe_stem}__{sha256_value[:12]}{extension}"
 
 
 def has_valid_output_file(path: Path) -> bool:
@@ -505,7 +529,7 @@ def build_ffmpeg_command(
     return command, decode_label
 
 
-def process_file(
+def process_video_file(
     config: AppConfig,
     source: Path,
     sha256_value: str,
@@ -579,22 +603,82 @@ def process_file(
     return sha256_value, str(source), str(output_path), decode_label
 
 
+def resolve_seven_zip_password(config: AppConfig) -> str:
+    password = config.seven_zip_password or os.environ.get(config.seven_zip_password_env)
+    if not password:
+        raise RuntimeError(
+            f"7z password is missing; set {config.seven_zip_password_env} or seven_zip_password in config"
+        )
+    return password
+
+
+def process_archive_file(config: AppConfig, source: Path, sha256_value: str, output_path: Path) -> tuple[str, str, str, str]:
+    if shutil.which(config.seven_zip) is None and not Path(config.seven_zip).exists():
+        raise RuntimeError(f"7z executable not found: {config.seven_zip}")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_output = output_path.with_suffix(".part.7z")
+    if temp_output.exists():
+        temp_output.unlink()
+
+    password = resolve_seven_zip_password(config)
+    command = [
+        config.seven_zip,
+        "a",
+        "-t7z",
+        "-mhe=on",
+        f"-p{password}",
+        "-y",
+        str(temp_output),
+        source.name,
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, cwd=source.parent)
+    if result.returncode != 0:
+        if temp_output.exists():
+            temp_output.unlink()
+        raise RuntimeError(f"7z failed for {source}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}")
+
+    temp_output.replace(output_path)
+    if not has_valid_output_file(output_path):
+        raise RuntimeError(f"invalid 7z archive generated (empty file): {output_path}")
+    return sha256_value, str(source), str(output_path), "7z:a:mhe"
+
+
+def process_file(
+    config: AppConfig,
+    source: Path,
+    sha256_value: str,
+    encoder: str,
+    available_decoders: set[str],
+    available_hwaccels: set[str],
+    output_path: Path,
+) -> tuple[str, str, str, str]:
+    if config.operation == "archive_7z":
+        return process_archive_file(config, source, sha256_value, output_path)
+    return process_video_file(
+        config, source, sha256_value, encoder, available_decoders, available_hwaccels, output_path
+    )
+
+
 def save_history(data_file: Path, history: dict[str, Any]) -> None:
     dump_yaml(data_file, history)
 
 
-def print_plan(config: AppConfig, encoder: str, candidate_count: int) -> None:
+def print_plan(config: AppConfig, processor: str, candidate_count: int) -> None:
     print("plan:")
     print(f"  1. scan input_dirs: {', '.join(str(path) for path in config.input_dirs)}")
-    print(f"  2. detect new video files by sha256 across {candidate_count} candidate(s)")
-    print(f"  3. encode to mp4 with {encoder} into {config.output_dir}")
+    print(f"  2. detect new files by sha256 across {candidate_count} candidate(s)")
+    if config.operation == "archive_7z":
+        print(f"  3. encrypt to 7z with {config.seven_zip} into {config.output_dir}")
+    else:
+        print(f"  3. encode to mp4 with {processor} into {config.output_dir}")
 
 
 def print_summary(
     processed: int,
     skipped: int,
     failed: int,
-    encoder: str,
+    processor: str,
     output_dir: Path,
     data_file: Path,
     status: str = "ok",
@@ -604,14 +688,15 @@ def print_summary(
     print(f"  processed: {processed}")
     print(f"  skipped: {skipped}")
     print(f"  failed: {failed}")
-    print(f"  encoder: {encoder}")
+    print(f"  processor: {processor}")
     print(f"  output_dir: {output_dir}")
     print(f"  data_file: {data_file}")
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Scan video folders and transcode to AV1 mp4.")
+    parser = argparse.ArgumentParser(description="Scan files and transcode videos or encrypt them as 7z archives.")
     parser.add_argument("--config", default="config.yml", help="Path to config.yml")
+    parser.add_argument("--operation", choices=("transcode", "archive_7z"), help="Processing operation")
     args = parser.parse_args(argv)
 
     config_path = Path(args.config).expanduser().resolve()
@@ -632,16 +717,22 @@ def main(argv: list[str] | None = None) -> int:
     summary_printed = False
 
     try:
-        config = load_config(config_path)
-        available_encoders = check_ffmpeg_encoders(config.ffmpeg)
-        available_decoders = check_ffmpeg_decoders(config.ffmpeg)
-        available_hwaccels = check_ffmpeg_hwaccels(config.ffmpeg)
-        encoder = select_encoder(config)
+        config = load_config(config_path, operation=args.operation)
+        if config.operation == "archive_7z":
+            available_encoders: set[str] = set()
+            available_decoders: set[str] = set()
+            available_hwaccels: set[str] = set()
+            processor = "7z"
+        else:
+            available_encoders = check_ffmpeg_encoders(config.ffmpeg)
+            available_decoders = check_ffmpeg_decoders(config.ffmpeg)
+            available_hwaccels = check_ffmpeg_hwaccels(config.ffmpeg)
+            processor = select_encoder(config)
         history = load_history(config.data_file)
         candidates = discover_video_files(config.input_dirs, config.extensions, [config.output_dir])
 
         summary_ready = True
-        summary_encoder = encoder
+        summary_encoder = processor
         summary_output_dir = config.output_dir
         summary_data_file = config.data_file
 
@@ -652,8 +743,9 @@ def main(argv: list[str] | None = None) -> int:
         queued_sha256: set[str] = set()
         submitted_jobs = 0
 
-        print_detection(config, encoder, available_encoders, available_decoders, available_hwaccels)
-        print_plan(config, encoder, len(candidates))
+        if config.operation == "transcode":
+            print_detection(config, processor, available_encoders, available_decoders, available_hwaccels)
+        print_plan(config, processor, len(candidates))
         print("process:")
         if not candidates:
             print("  none")
@@ -680,7 +772,8 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"process: {source}")
                     try:
                         sha256_value = hash_prefix_of_file(source, config.hash_prefix_bytes)
-                        record = history_map.setdefault(sha256_value, {})
+                        history_key = sha256_value if config.operation == "transcode" and sha256_value in history_map else f"{config.operation}:{sha256_value}"
+                        record = history_map.setdefault(history_key, {})
                         output_path = Path(record.get("output_path") or build_output_path(config, source, sha256_value))
 
                         source_stat = source.stat()
@@ -697,7 +790,8 @@ def main(argv: list[str] | None = None) -> int:
                         already_processed = bool(record.get("processed_at")) and has_valid_output_file(output_path)
                         if already_processed:
                             record.setdefault("output_path", str(output_path))
-                            record.setdefault("encoder", encoder)
+                            record.setdefault("operation", config.operation)
+                            record.setdefault("processor", processor)
                             print(f"skip processed {source}")
                             skipped += 1
                             continue
@@ -716,7 +810,7 @@ def main(argv: list[str] | None = None) -> int:
                             config,
                             source,
                             sha256_value,
-                            encoder,
+                            processor,
                             available_decoders,
                             available_hwaccels,
                             output_path,
@@ -735,11 +829,13 @@ def main(argv: list[str] | None = None) -> int:
                     source, sha256_value, output_path = future_to_job.pop(future)
                     try:
                         done_sha, done_source, done_output_path, decode_label = future.result()
-                        record = history_map.setdefault(done_sha, {})
+                        history_key = done_sha if config.operation == "transcode" and done_sha in history_map else f"{config.operation}:{done_sha}"
+                        record = history_map.setdefault(history_key, {})
                         record.update(
                             {
                                 "output_path": done_output_path,
-                                "encoder": encoder,
+                                "operation": config.operation,
+                                "processor": processor,
                                 "decode": decode_label,
                                 "processed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                                 "status": "processed",
@@ -754,11 +850,13 @@ def main(argv: list[str] | None = None) -> int:
                                 file=sys.stderr,
                             )
                     except Exception as exc:  # pragma: no cover - surfaced to the user
-                        record = history_map.setdefault(sha256_value, {})
+                        history_key = sha256_value if config.operation == "transcode" and sha256_value in history_map else f"{config.operation}:{sha256_value}"
+                        record = history_map.setdefault(history_key, {})
                         record.update(
                             {
                                 "output_path": str(output_path),
-                                "encoder": encoder,
+                                "operation": config.operation,
+                                "processor": processor,
                                 "status": "failed",
                                 "last_error": str(exc),
                                 "failed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -778,7 +876,7 @@ def main(argv: list[str] | None = None) -> int:
         summary_processed = processed
         summary_skipped = skipped
         summary_failed = failed
-        print_summary(processed, skipped, failed, encoder, config.output_dir, config.data_file)
+        print_summary(processed, skipped, failed, processor, config.output_dir, config.data_file)
         summary_printed = True
         return 0 if failed == 0 else 1
     except Exception as exc:
